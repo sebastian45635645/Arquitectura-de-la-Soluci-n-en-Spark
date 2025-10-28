@@ -1,0 +1,209 @@
+1) batch_job.py — procesamiento batch (PySpark DataFrame)
+
+Guarda como batch_job.py. Ajusta rutas de entrada/salida según tu entorno (hdfs:// o file://).
+
+# batch_job.py
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import col, to_timestamp, hour, avg, count
+
+def main():
+    spark = SparkSession.builder \
+        .appName("AirQualityBatchJob") \
+        .getOrCreate()
+
+    # Ruta del CSV (ajusta: hdfs:///ruta/air_quality.csv o file:///local/air_quality.csv)
+    input_path = "file:///tmp/air_quality.csv"
+    output_path = "file:///tmp/results/air_quality_hourly.parquet"
+
+    # Leer CSV (ejemplo con separador ';' si aplica)
+    df = spark.read.option("header", True).option("sep", ";").csv(input_path)
+
+    # Conversión de tipos (ajusta nombres de columnas a tu CSV real)
+    # Ejemplo de columnas: Date, Time, CO_GT, PT08_S1_CO, NMHC_GT, NOx_GT, NO2_GT, T, RH, AH
+    # Creamos una columna timestamp si Date y Time existen
+    if "Date" in df.columns and "Time" in df.columns:
+        df = df.withColumn("timestamp",
+                           to_timestamp(col("Date").cast("string") + " " + col("Time").cast("string"),
+                                        "dd/MM/yyyy HH.mm.ss"))
+    else:
+        # Si ya existe timestamp
+        if "timestamp" in df.columns:
+            df = df.withColumn("timestamp", to_timestamp(col("timestamp")))
+
+    # Cast a double para contaminantes (intenta manejar valores no numéricos)
+    numeric_cols = [c for c in df.columns if c not in ("Date", "Time", "timestamp")]
+    for c in numeric_cols:
+        try:
+            df = df.withColumn(c, col(c).cast("double"))
+        except Exception:
+            pass
+
+    # Limpieza básica: quitar filas sin timestamp
+    df = df.na.drop(subset=["timestamp"])
+
+    # Agregación por estación hipotética o global por hora
+    df = df.withColumn("hour", hour(col("timestamp")))
+
+    # Ejemplo: promedio de CO_GT por hora
+    agg = df.groupBy("hour").agg(
+        count("*").alias("records"),
+        avg("CO_GT").alias("avg_CO"),
+        avg("NOx_GT").alias("avg_NOx")
+    ).orderBy("hour")
+
+    agg.show(50, truncate=False)
+
+    # Guardar resultados en Parquet
+    agg.write.mode("overwrite").parquet(output_path)
+
+    spark.stop()
+
+if __name__ == "__main__":
+    main()
+
+2) kafka_producer_sim.py — productor Kafka (simula sensores)
+
+Guarda como kafka_producer_sim.py. Este script puede leer el CSV y enviar fila por fila como JSON al topic air_quality_stream.
+
+# kafka_producer_sim.py
+import json
+import time
+import argparse
+from kafka import KafkaProducer
+import csv
+import random
+
+def make_event_from_row(row, header):
+    # Construye un dict a partir de una fila CSV y encabezados
+    event = {}
+    for i, h in enumerate(header):
+        event[h] = row[i]
+    # Añadir un id y timestamp de envío
+    event["_sim_id"] = random.randint(1, 10**6)
+    event["_sent_at_ms"] = int(time.time() * 1000)
+    return event
+
+def produce(csv_path, bootstrap_servers="localhost:9092", topic="air_quality_stream", delay=0.2):
+    producer = KafkaProducer(
+        bootstrap_servers=bootstrap_servers,
+        value_serializer=lambda v: json.dumps(v).encode("utf-8")
+    )
+
+    with open(csv_path, newline='', encoding='utf-8') as f:
+        reader = csv.reader(f, delimiter=';')  # ajusta delimitador si tu CSV usa ','
+        header = next(reader)
+        for row in reader:
+            event = make_event_from_row(row, header)
+            producer.send(topic, event)
+            print(f"Sent event to {topic}: {event.get(header[0], '')} ...")
+            time.sleep(delay)
+    producer.flush()
+    producer.close()
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Kafka producer simulator for Air Quality dataset")
+    parser.add_argument("--csv", required=True, help="Path to CSV file (local)")
+    parser.add_argument("--broker", default="localhost:9092", help="Kafka broker")
+    parser.add_argument("--topic", default="air_quality_stream")
+    parser.add_argument("--delay", type=float, default=0.2, help="Seconds between messages")
+    args = parser.parse_args()
+    produce(args.csv, args.broker, args.topic, args.delay)
+
+Crear topic (en Kafka local):
+
+$KAFKA_HOME/bin/kafka-topics.sh --create --topic air_quality_stream --bootstrap-server localhost:9092 --replication-factor 1 --partitions 3
+
+3) streaming_app.py — Spark Structured Streaming consumiendo Kafka
+
+Guarda como streaming_app.py. Ajusta kafka.bootstrap.servers si tu broker no es localhost:9092.
+
+# streaming_app.py
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import from_json, col, window, to_timestamp
+from pyspark.sql.types import StructType, StringType, DoubleType, TimestampType
+
+def main():
+    spark = SparkSession.builder \
+        .appName("AirQualityStreaming") \
+        .getOrCreate()
+
+    # Schema aproximado: ajusta según encabezados reales de tu CSV
+    # Ejemplo de campos comunes en Air Quality dataset:
+    schema = StructType() \
+        .add("Date", StringType()) \
+        .add("Time", StringType()) \
+        .add("CO_GT", StringType()) \
+        .add("PT08_S1_CO", StringType()) \
+        .add("NMHC_GT", StringType()) \
+        .add("NOx_GT", StringType()) \
+        .add("NO2_GT", StringType()) \
+        .add("T", StringType()) \
+        .add("RH", StringType()) \
+        .add("AH", StringType()) \
+        .add("_sim_id", StringType()) \
+        .add("_sent_at_ms", StringType())
+
+    kafka_bootstrap = "localhost:9092"
+    kafka_topic = "air_quality_stream"
+
+    raw = spark.readStream \
+        .format("kafka") \
+        .option("kafka.bootstrap.servers", kafka_bootstrap) \
+        .option("subscribe", kafka_topic) \
+        .option("startingOffsets", "latest") \
+        .load()
+
+    # kafka value is bytes -> string
+    json_str = raw.selectExpr("CAST(value AS STRING) as json_str")
+
+    # Parse JSON
+    df_parsed = json_str.select(from_json(col("json_str"), schema).alias("data")).select("data.*")
+
+    # Create a proper timestamp column: convert Date+Time or use _sent_at_ms
+    # Try using _sent_at_ms if Date/Time not usable
+    df_with_ts = df_parsed.withColumn("event_time", (col("_sent_at_ms").cast("long")/1000).cast(TimestampType()))
+
+    # Cast numeric columns
+    df_cast = df_with_ts \
+        .withColumn("CO_GT", col("CO_GT").cast(DoubleType())) \
+        .withColumn("NOx_GT", col("NOx_GT").cast(DoubleType())) \
+        .withColumn("T", col("T").cast(DoubleType()))
+
+    # Example aggregation: average CO and NOx per 1-minute window
+    agg = df_cast.groupBy(window(col("event_time"), "1 minute")) \
+                 .agg({'CO_GT': 'avg', 'NOx_GT': 'avg'}) \
+                 .selectExpr("window.start as window_start", "window.end as window_end",
+                             "avg(CO_GT) as avg_CO", "avg(NOx_GT) as avg_NOx")
+
+    # Output to console (for testing). In prod, write to Parquet/HDFS/Elasticsearch/etc.
+    query = agg.writeStream \
+        .outputMode("complete") \
+        .format("console") \
+        .option("truncate", False) \
+        .start()
+
+    query.awaitTermination()
+
+if __name__ == "__main__":
+    main()
+
+Comandos de ejecución (resumen)
+
+Levanta Kafka (y Zookeeper si tu instalación lo requiere).
+
+Crea topic:
+
+$KAFKA_HOME/bin/kafka-topics.sh --create --topic air_quality_stream --bootstrap-server localhost:9092 --replication-factor 1 --partitions 3
+
+Lanzar productor (envía datos desde CSV):
+
+python kafka_producer_sim.py --csv /ruta/air_quality.csv --broker localhost:9092 --topic air_quality_stream --delay 0.2
+
+Ejecutar Spark streaming (desde un cluster o spark-submit local con jars Kafka):
+
+spark-submit --packages org.apache.spark:spark-sql-kafka-0-10_2.12:3.3.2 streaming_app.py
+
+Ejecutar job batch:
+
+spark-submit batch_job.py
+
