@@ -1,4 +1,4 @@
-Se realizó una corrección del código original debido a los siguientes aspectos: diferencias en el formato (las cuales generaban errores por el uso incorrecto de “/” y paréntesis), duplicidad en la creación de la SparkSession, y la limpieza general del código para mejorar su estructura y evitar fallos en la ejecución.
+Se realizó una corrección del código original (CONSUMER) debido a los siguientes aspectos: diferencias en el formato (las cuales generaban errores por el uso incorrecto de “/” y paréntesis), duplicidad en la creación de la SparkSession, y la limpieza general del código para mejorar su estructura y evitar fallos en la ejecución.
 
 
 1.  (Codigo Original - Productor (producer) de Kafka)
